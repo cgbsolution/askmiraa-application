@@ -1,0 +1,149 @@
+"""Generate `src/core/api.gen.ts` from the backend's own OpenAPI schema.
+
+The mobile app's request and response shapes mirror the backend's Pydantic
+schemas. Generating them from `app.openapi()` keeps the two from drifting:
+a renamed field shows up as a type error on the screen that reads it, not as
+a blank value on someone's payslip.
+
+    # from mobile/, with the backend's virtualenv
+    ../backend/.venv/Scripts/python.exe scripts/gen_api_types.py
+    # or from a saved spec
+    python scripts/gen_api_types.py path/to/openapi.json
+
+Endpoints that return a plain `dict` have no schema here; their shapes are
+written by hand in `src/core/types.ts`, next to the generated ones.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+MOBILE = Path(__file__).resolve().parent.parent
+OUT = MOBILE / "src" / "core" / "api.gen.ts"
+
+PREFIXES = (
+    "app__schemas__",
+    "app__api__v1__routers__",
+    "app__services__",
+    "app__models__",
+)
+
+
+def load_spec() -> dict:
+    if len(sys.argv) > 1:
+        return json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    sys.path.insert(0, str(MOBILE.parent / "backend"))
+    from app.main import app  # noqa: PLC0415 — the backend, imported on purpose
+
+    return app.openapi()
+
+
+def ts_name(name: str) -> str:
+    """`app__schemas__expenses__ClaimRead` -> `ExpensesClaimRead`."""
+    for prefix in PREFIXES:
+        if name.startswith(prefix):
+            parts = name[len(prefix):].split("__")
+            module = "".join(p.capitalize() for part in parts[:-1] for p in part.split("_"))
+            name = module + parts[-1]
+            break
+    return re.sub(r"[^A-Za-z0-9_]", "", name)
+
+
+def ts_type(schema: dict) -> str:
+    if not schema:
+        return "unknown"
+    if "$ref" in schema:
+        return ts_name(schema["$ref"].split("/")[-1])
+    if "anyOf" in schema or "oneOf" in schema:
+        options = [ts_type(s) for s in schema.get("anyOf", schema.get("oneOf", []))]
+        seen: list[str] = []
+        for option in options:
+            if option not in seen:
+                seen.append(option)
+        return " | ".join(seen)
+    if "allOf" in schema and len(schema["allOf"]) == 1:
+        return ts_type(schema["allOf"][0])
+    if "enum" in schema:
+        return " | ".join(json.dumps(v) for v in schema["enum"])
+    if "const" in schema:
+        return json.dumps(schema["const"])
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        return " | ".join(ts_type({**schema, "type": k}) for k in kind)
+    if kind == "string":
+        return "string"
+    if kind in ("integer", "number"):
+        return "number"
+    if kind == "boolean":
+        return "boolean"
+    if kind == "null":
+        return "null"
+    if kind == "array":
+        inner = ts_type(schema.get("items", {}))
+        return f"({inner})[]" if "|" in inner else f"{inner}[]"
+    if kind == "object":
+        if "properties" in schema:
+            return "{ " + "; ".join(
+                f"{json.dumps(k) if not k.isidentifier() else k}{'' if k in schema.get('required', []) else '?'}: {ts_type(v)}"
+                for k, v in schema["properties"].items()
+            ) + " }"
+        extra = schema.get("additionalProperties")
+        if isinstance(extra, dict) and extra:
+            return f"Record<string, {ts_type(extra)}>"
+        return "Record<string, unknown>"
+    return "unknown"
+
+
+def comment(text: str | None, indent: str = "") -> str:
+    if not text:
+        return ""
+    lines = [line.rstrip() for line in text.strip().splitlines()]
+    if len(lines) == 1:
+        return f"{indent}/** {lines[0].replace('*/', '* /')} */\n"
+    body = "\n".join(f"{indent} * {line.replace('*/', '* /')}".rstrip() for line in lines)
+    return f"{indent}/**\n{body}\n{indent} */\n"
+
+
+def render(name: str, schema: dict) -> str:
+    out = comment(schema.get("description"))
+    tsn = ts_name(name)
+    if "enum" in schema or schema.get("type") != "object" or "properties" not in schema:
+        return out + f"export type {tsn} = {ts_type(schema)};\n"
+    required = set(schema.get("required", []))
+    lines = []
+    for key, value in schema["properties"].items():
+        key_ts = key if key.isidentifier() else json.dumps(key)
+        optional = "" if key in required else "?"
+        lines.append(comment(value.get("description"), "  ") + f"  {key_ts}{optional}: {ts_type(value)};")
+    return out + f"export interface {tsn} {{\n" + "\n".join(lines) + "\n}\n"
+
+
+def main() -> None:
+    spec = load_spec()
+    schemas = spec["components"]["schemas"]
+    names: dict[str, str] = {}
+    for name in schemas:
+        tsn = ts_name(name)
+        if tsn in names:
+            raise SystemExit(f"Two schemas map to {tsn}: {names[tsn]} and {name}")
+        names[tsn] = name
+    header = (
+        "/* eslint-disable */\n"
+        "/**\n"
+        " * GENERATED by scripts/gen_api_types.py from the backend's OpenAPI schema.\n"
+        " * Do not edit by hand: change the Pydantic schema and regenerate.\n"
+        " *\n"
+        " * Decimal amounts arrive as strings and stay strings (see core/money.ts);\n"
+        " * dates are ISO strings.\n"
+        " */\n\n"
+    )
+    body = "\n".join(render(name, schemas[name]) for name in sorted(schemas, key=ts_name))
+    OUT.write_text(header + body, encoding="utf-8", newline="\n")
+    print(f"{len(schemas)} schemas -> {OUT.relative_to(MOBILE)} ({OUT.stat().st_size // 1024} KB)")
+
+
+if __name__ == "__main__":
+    main()
